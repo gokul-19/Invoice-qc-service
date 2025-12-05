@@ -1,99 +1,67 @@
 import pdfplumber
 import re
 import os
+import yaml
 import json
 from .schemas import Invoice, LineItem
-from .utils import extract_date, extract_amount
-
 
 class InvoiceExtractor:
+    def __init__(self):
+        cfg_dir = os.path.join(os.path.dirname(__file__), "config")
+        with open(os.path.join(cfg_dir, "patterns.yaml")) as f:
+            self.patterns = yaml.safe_load(f)
+        with open(os.path.join(cfg_dir, "currency_list.json")) as f:
+            self.valid_currencies = json.load(f)
 
-    def extract_invoices(self, pdf_dir: str):
-        invoices = []
-        for filename in os.listdir(pdf_dir):
-            if filename.lower().endswith(".pdf"):
-                full_path = os.path.join(pdf_dir, filename)
-                invoices.append(self.extract_single(full_path))
-        return invoices
-
-    def extract_single(self, pdf_path: str):
-        with pdfplumber.open(pdf_path) as pdf:
-            full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-
-        invoice_number = self.extract_invoice_number(full_text)
-        invoice_date = extract_date(full_text)
-        due_date = self.extract_due_date(full_text)
-
-        seller_name = self.find_after(full_text, "Seller")
-        buyer_name = self.find_after(full_text, "Buyer")
-
-        currency = self.extract_currency(full_text)
-        net_total = self.extract_amount_near(full_text, "Net")
-        tax_amount = self.extract_amount_near(full_text, "Tax")
-        gross_total = self.extract_amount_near(full_text, "Total")
-
-        line_items = self.extract_line_items(full_text)
-
-        return Invoice(
-            invoice_number=invoice_number,
-            invoice_date=invoice_date,
-            due_date=due_date,
-            seller_name=seller_name,
-            buyer_name=buyer_name,
-            currency=currency,
-            net_total=net_total,
-            tax_amount=tax_amount,
-            gross_total=gross_total,
-            line_items=line_items,
-        )
-
-    # ============= Helpers ==================
-    
-    def extract_invoice_number(self, text):
-        patterns = [
-            r"Invoice\s*(No|Number|#)[:\s]+(\S+)",
-            r"Invoice\s*ID[:\s]+(\S+)"
-        ]
-        for pat in patterns:
-            match = re.search(pat, text, re.IGNORECASE)
+    def _find_value(self, text, labels):
+        for label in labels:
+            pattern = rf"{label}\s*[:\-]?\s*(.+)"
+            match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return match.group(2) if match.lastindex >= 2 else match.group(1)
+                return match.group(1).strip()
         return None
 
-    def extract_due_date(self, text):
-        m = re.search(r"Due\s*Date[:\s]+(\d{2}/\d{2}/\d{4})", text)
-        return m.group(1) if m else None
-
-    def extract_currency(self, text):
-        for cur in ["INR", "EUR", "USD"]:
-            if cur in text:
-                return cur
-        return None
-
-    def extract_amount_near(self, text, label):
-        pattern = fr"{label}[:\s]+(\d+[\.,]?\d*)"
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            return float(m.group(1).replace(",", ""))
-        return None
-
-    def extract_line_items(self, text):
+    def _extract_line_items(self, text):
         items = []
         lines = text.split("\n")
         for line in lines:
-            parts = re.split(r"\s{2,}", line)
-            if len(parts) == 3:
-                desc = parts[0]
-                qty = self.safe_float(parts[1])
-                total = self.safe_float(parts[2])
-                if qty is not None and total is not None:
-                    unit = total / qty if qty else None
-                    items.append(LineItem(description=desc, quantity=qty,
-                                          unit_price=unit or 0, line_total=total))
+            parts = re.split(r"\s{2,}", line.strip())
+            if len(parts) >= 4:
+                desc, qty, price, total = parts[:4]
+                if re.match(r"^\d+(\.\d+)?$", qty) and re.match(r"^\d+(\.\d+)?$", price):
+                    items.append(
+                        LineItem(
+                            description=desc,
+                            quantity=float(qty),
+                            unit_price=float(price),
+                            line_total=float(total) if total.replace(".", "", 1).isdigit() else None
+                        )
+                    )
         return items
 
-    def safe_float(self, v):
-        try:
-            return float(v.replace(",", ""))
-        except:
-            return None
+    def extract_single(self, pdf_path):
+        with pdfplumber.open(pdf_path) as pdf:
+            pages_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
+
+        data = {}
+        for key, labels in self.patterns.items():
+            data[key] = self._find_value(pages_text, labels)
+
+        for f in ["net_total", "tax_amount", "gross_total"]:
+            if data.get(f) and re.match(r"^\d+(\.\d+)?$", data[f]):
+                data[f] = float(data[f])
+            else:
+                data[f] = None
+
+        data["currency"] = next((c for c in self.valid_currencies if c in pages_text), None)
+        data["line_items"] = self._extract_line_items(pages_text)
+
+        return Invoice(**data)
+
+    def extract_folder(self, pdf_dir):
+        results = []
+        for file in os.listdir(pdf_dir):
+            if file.lower().endswith(".pdf"):
+                path = os.path.join(pdf_dir, file)
+                results.append(self.extract_single(path).dict())
+        return results
