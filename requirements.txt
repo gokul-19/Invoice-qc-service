@@ -1,4 +1,6 @@
-pdfplumber
-fastapi
-uvicorn
+streamlit
 pydantic
+PyMuPDF==1.23.8
+pdfplumber
+python-dateutil
+PyYAML
